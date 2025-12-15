@@ -1,2 +1,0 @@
-# my-trading-app
-trading
