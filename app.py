@@ -174,4 +174,13 @@ else:
     with st.expander("查看最近 5 日詳細數據"):
         cols_to_show = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'Signal', 'Stop_Loss']
 
-        st.dataframe(df[cols_to_show].tail(5).style.format("{:.2f}"))
+        st.dataframe(
+            df[cols_to_show].tail(5).style.format({
+            'Color': '{:.2f}', 
+            'Volume': '{:.0f}'
+            'EMA_8': '{:.2f}'
+            'EMA_21': '{:.2f}'
+            'MACD_Hist': '{:.2f}'
+            'Stop_Loss': '{:.2f}'
+            })
+
