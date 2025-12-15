@@ -183,5 +183,6 @@ else:
             'MACD_Hist': '{:.2f}',
             'Stop_Loss': '{:.2f}'
             })
+            )
 
 
