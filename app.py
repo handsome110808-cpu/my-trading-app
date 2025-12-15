@@ -1,4 +1,4 @@
-Python
+
 
 import streamlit as st
 import yfinance as yf
@@ -173,4 +173,5 @@ else:
     # --- 4. 歷史數據表格 (可展開) ---
     with st.expander("查看最近 5 日詳細數據"):
         cols_to_show = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'Signal', 'Stop_Loss']
+
         st.dataframe(df[cols_to_show].tail(5).style.format("{:.2f}"))
