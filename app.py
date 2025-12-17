@@ -235,4 +235,5 @@ else:
         fig.add_trace(go.Scatter(x=df.index, y=df['EMA_21'], line=dict(color='#007BFF', width=2), name='EMA 21'), row=1, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=df['Stop_Loss'], line=dict(color='#D32F2F', width=1, dash='dot'), name='ATR Stop'), row=1, col=1)
 
-        colors_vol = ['#008000'
+        colors_vol = ['#008000']
+
