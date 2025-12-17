@@ -1,188 +1,280 @@
-
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-import numpy as np
-import datetime
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import requests
 
-# --- 網頁設定 (配置為寬屏模式) ---
+# --- 1. 頁面設定 (寬螢幕 + 深色模式) ---
 st.set_page_config(
-    page_title="AlphaTrader - AI 量化交易終端",
-    page_icon="📈",
-    layout="wide",  # 寬屏模式，更有專業感
-    initial_sidebar_state="expanded"
+    page_title="US Market Alpha Terminal",
+    page_icon="🇺🇸",
+    layout="wide",
+    initial_sidebar_state="collapsed" # 預設隱藏側邊欄
 )
 
-# --- 自定義 CSS (讓介面更像專業軟體) ---
+# --- 自定義 CSS (橫向佈局優化 & 深色護眼) ---
 st.markdown("""
 <style>
-    .metric-card {
-        background-color: #f0f2f6;
-        border-radius: 10px;
+    /* 全局背景 - 深炭灰 */
+    .stApp { background-color: #0E1117; color: #FAFAFA; }
+    
+    /* 頂部控制列樣式 */
+    .control-panel {
+        background-color: #1E1E1E;
         padding: 15px;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
+        border-radius: 10px;
+        margin-bottom: 20px;
+        border: 1px solid #333;
     }
-    .stAlert {
-        font-weight: bold;
+
+    /* 數據卡片 */
+    .metric-card {
+        background-color: #1E1E1E;
+        border: 1px solid #333;
+        padding: 15px;
+        border-radius: 10px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+        text-align: center;
     }
+    
+    /* 美股顏色 (綠漲紅跌) */
+    .up-color { color: #00CC96 !important; }
+    .down-color { color: #FF4B4B !important; }
+    
+    /* 調整按鈕樣式 */
+    div.stButton > button { border-radius: 5px; height: 3em; }
 </style>
 """, unsafe_allow_html=True)
 
-
-# --- 核心邏輯函數 ---
-@st.cache_data(ttl=60)  # 數據快取 60秒，確保數據不過舊但也不會頻繁請求
-def get_signal(ticker, atr_mult):
+# --- 2. 核心數據函數 ---
+@st.cache_data(ttl=60) # 美股盤中變動快，快取縮短為 60秒
+def get_us_stock_data(ticker, atr_mult):
     try:
-        # 下載數據
-        df = yf.download(ticker, period="6mo", progress=False)
-
-        # 處理 yfinance 格式問題
+        # 抓取數據
+        df = yf.download(ticker, period="1y", interval="1d", progress=False)
+        
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+            
+        if len(df) < 50: return None
 
-        if len(df) < 50:
-            return None, "數據不足，無法計算指標"
-
-        # 計算指標
+        # 計算美股動能指標 (EMA 8/21)
         df['EMA_8'] = ta.ema(df['Close'], length=8)
         df['EMA_21'] = ta.ema(df['Close'], length=21)
-
+        
+        # MACD
         macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
-        df = pd.concat([df, macd], axis=1)
-        # 欄位重新命名以防萬一
-        df.rename(columns={
-            df.columns[-3]: 'MACD_Line',
-            df.columns[-2]: 'MACD_Hist',
-            df.columns[-1]: 'MACD_Signal'
-        }, inplace=True)
+        if macd is not None:
+            df = pd.concat([df, macd], axis=1)
+            df.rename(columns={
+                df.columns[-3]: 'MACD_Line',
+                df.columns[-2]: 'MACD_Hist',
+                df.columns[-1]: 'MACD_Signal'
+            }, inplace=True)
 
-        df['Vol_SMA_10'] = ta.sma(df['Volume'], length=10)
+        # ATR 止損計算
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-
-        # 計算 ATR 止損價
         df['Stop_Loss'] = df['Close'] - (df['ATR'] * atr_mult)
+        
+        # 成交量均線
+        df['Vol_SMA_10'] = ta.sma(df['Volume'], length=10)
+        
+        return df
+    except Exception:
+        return None
 
-        # 訊號邏輯
-        conditions = [
-            (df['Close'] > df['EMA_8']) &
-            (df['EMA_8'] > df['EMA_21']) &
-            (df['MACD_Hist'] > 0) &
-            (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) &
-            (df['Volume'] > df['Vol_SMA_10'] * 1.2)
-        ]
+def analyze_us_strategy(df):
+    if df is None: return "N/A", "gray", [], 0
+    
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    score = 0
+    signals = []
+    
+    # 1. EMA 趨勢 (美股動能核心)
+    if curr['Close'] > curr['EMA_8'] and curr['EMA_8'] > curr['EMA_21']:
+        score += 40
+        signals.append("✅ 強勢多頭 (價格 > EMA8 > EMA21)")
+    elif curr['Close'] < curr['EMA_21']:
+        score -= 30
+        signals.append("⚠️ 跌破 EMA21 (動能消失)")
+    else:
+        signals.append("⚪ 震盪整理中")
 
-        choices = ['BUY']
-        df['Signal'] = np.select(conditions, choices, default='HOLD')
+    # 2. MACD 動能
+    if curr['MACD_Hist'] > 0 and curr['MACD_Hist'] > prev['MACD_Hist']:
+        score += 30
+        signals.append("✅ MACD 動能加速 (紅柱變長)")
+    elif curr['MACD_Hist'] < 0:
+        score -= 20
+        signals.append("🔴 MACD 空方主導")
 
-        # 賣出條件
-        sell_cond = (df['Close'] < df['EMA_21']) | (df['MACD_Hist'] < 0)
-        df.loc[sell_cond, 'Signal'] = 'SELL'
+    # 3. 爆量突破
+    vol_ratio = curr['Volume'] / curr['Vol_SMA_10']
+    if vol_ratio > 1.2:
+        score += 30
+        signals.append(f"🔥 爆量攻擊 (量增 {vol_ratio:.1f}x)")
+    
+    # 綜合判定
+    if score >= 70:
+        return "STRONG BUY (積極買進)", "#00CC96" # 美股綠色是漲/買
+    elif score <= 20:
+        return "SELL / EXIT (止損離場)", "#FF4B4B" # 美股紅色是跌/賣
+    else:
+        return "HOLD (續抱/觀望)", "#FFA500"
 
-        return df, None
-    except Exception as e:
-        return None, str(e)
+def send_line_notify(token, message):
+    url = "https://notify-api.line.me/api/notify"
+    headers = {"Authorization": "Bearer " + token}
+    data = {"message": message}
+    try:
+        requests.post(url, headers=headers, data=data)
+        return True
+    except:
+        return False
 
+# --- 3. UI 佈局：頂部橫向控制台 ---
 
-# --- 側邊欄：控制台 ---
-with st.sidebar:
-    st.title("🎛️ 交易控制台")
-    st.markdown("---")
+st.title("🇺🇸 US Market Alpha Terminal")
 
-    # 股票選擇
-    ticker_list = ['TSLA', 'NVDA', 'AVGO', 'MU', 'ORCL', 'AMD', 'PLTR']
-    selected_ticker = st.selectbox("選擇標的 (Ticker)", ticker_list, index=0)
+# 使用 Container 包裹控制項，模擬 Top Bar
+with st.container():
+    st.markdown('<div class="control-panel">', unsafe_allow_html=True)
+    
+    # 分割為 4 欄：股票選擇 | ATR 設定 | Token 輸入 | 狀態顯示
+    c1, c2, c3 = st.columns([1.5, 1.5, 2])
+    
+    with c1:
+        # 整理後的股票清單 (已排序)
+        ticker_list = sorted([
+            "AAPL", "AMD", "AVGO", "APP", "ASML", "GOOG", "HIMS", "INTC", 
+            "LLY", "LRCX", "MSFT", "TSM", "NVDA", "ORCL", "PLTR", 
+            "QQQ", "SPY", "TEM", "TSLA", "XLV"
+        ])
+        selected_ticker = st.selectbox("選擇股票 (Symbol)", ticker_list)
+        
+    with c2:
+        atr_mult = st.slider("ATR 止損係數", 1.5, 4.0, 2.5, 0.1, help="係數越大，止損越寬 (適合 TSLA/NVDA)")
+        
+    with c3:
+        line_token = st.text_input("LINE Notify Token", type="password", placeholder="貼上 Token 以啟用通知")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    # 參數微調
-    st.subheader("參數設定")
-    atr_multiplier = st.slider("ATR 止損乘數", 1.5, 4.0, 2.5, 0.1, help="數值越大，止損越寬，適合高波動股票")
+# --- 4. 主數據顯示 ---
 
-    st.markdown("---")
-    st.caption(f"系統時間: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    st.caption("Designed for Alpha Generation")
+df = get_us_stock_data(selected_ticker, atr_mult)
 
-# --- 主頁面 ---
-st.title(f"📊 {selected_ticker} 量化分析儀表板")
-
-# 執行分析
-df, error = get_signal(selected_ticker, atr_multiplier)
-
-if error:
-    st.error(f"發生錯誤: {error}")
+if df is None:
+    st.error(f"❌ 無法取得 {selected_ticker} 數據，請稍後再試。")
 else:
     last_row = df.iloc[-1]
     prev_row = df.iloc[-2]
-    signal = last_row['Signal']
+    
+    # 計算美股漲跌 (綠漲紅跌)
+    change = last_row['Close'] - prev_row['Close']
+    pct_change = (change / prev_row['Close']) * 100
+    price_color = "#00CC96" if change >= 0 else "#FF4B4B"
+    
+    # 策略運算
+    action, action_color, reasons, score = analyze_us_strategy(df)
+    
+    # --- 數據儀表板 (Metrics) ---
+    m1, m2, m3, m4 = st.columns(4)
+    
+    with m1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="color:#aaa; font-size:14px;">Current Price</div>
+            <div style="font-size:28px; font-weight:bold; color:{price_color};">
+                ${last_row['Close']:.2f}
+            </div>
+            <div style="color:{price_color}; font-size:16px;">
+                {change:+.2f} ({pct_change:+.2f}%)
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with m2:
+         st.markdown(f"""
+        <div class="metric-card">
+            <div style="color:#aaa; font-size:14px;">AI Signal</div>
+            <div style="font-size:24px; font-weight:bold; color:{action_color};">
+                {action.split(' ')[0]}
+            </div>
+            <div style="color:#ccc; font-size:14px;">Score: {score}/100</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # --- 1. 頂部狀態橫幅 (Hero Section) ---
-    if signal == 'BUY':
-        st.success(f"🔥 交易訊號：強力買進 (STRONG BUY) - 動能爆發中")
-    elif signal == 'SELL':
-        st.error(f"🛑 交易訊號：離場/止損 (SELL/EXIT) - 趨勢破壞")
-    else:
-        st.info(f"👀 交易訊號：觀望/持有 (HOLD) - 等待機會")
-
-    # --- 2. 核心數據 (KPIs) ---
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric("最新價格", f"${last_row['Close']:.2f}", f"{(last_row['Close'] - prev_row['Close']):.2f}")
-    with col2:
-        st.metric("建議止損 (Stop Loss)", f"${last_row['Stop_Loss']:.2f}", delta_color="off")
-    with col3:
+    with m3:
         risk = last_row['Close'] - last_row['Stop_Loss']
-        st.metric("單股風險 (Risk)", f"${risk:.2f}", help="每買一股可能虧損的最大金額")
-    with col4:
-        vol_ratio = last_row['Volume'] / last_row['Vol_SMA_10']
-        st.metric("相對量能 (RVol)", f"{vol_ratio:.1f}x", delta="爆量" if vol_ratio > 1.2 else "縮量")
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="color:#aaa; font-size:14px;">Stop Loss (ATR)</div>
+            <div style="font-size:28px; font-weight:bold; color:#FF4B4B;">
+                ${last_row['Stop_Loss']:.2f}
+            </div>
+            <div style="color:#aaa; font-size:14px;">Risk: ${risk:.2f}/share</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    st.markdown("---")
+    with m4:
+        # 發送按鈕區塊
+        st.write("") # Spacer
+        if st.button("📲 發送訊號到 LINE", type="primary", use_container_width=True, disabled=not line_token):
+            if not line_token:
+                st.error("Missing Token")
+            else:
+                msg = f"\n🇺🇸【美股快訊】\n標的：{selected_ticker}\n現價：${last_row['Close']:.2f}\n訊號：{action}\n止損：${last_row['Stop_Loss']:.2f}\n理由：{', '.join([r.split(' ')[1] for r in reasons])}"
+                if send_line_notify(line_token, msg):
+                    st.toast("Sent successfully!", icon="✅")
+                else:
+                    st.error("Failed to send")
 
-    # --- 3. 詳細技術分析 (分欄顯示) ---
-    c1, c2 = st.columns([1, 2])  # 左窄右寬
+    st.write("") # Spacer
 
-    with c1:
-        st.subheader("🛠️ 技術診斷")
-        # 趨勢
-        if last_row['EMA_8'] > last_row['EMA_21']:
-            st.markdown("✅ **趨勢：** 短線多頭排列 (EMA8 > EMA21)")
-        else:
-            st.markdown("⚠️ **趨勢：** 趨勢偏弱或整理中")
-
-        # MACD
-        if last_row['MACD_Hist'] > 0 and last_row['MACD_Hist'] > prev_row['MACD_Hist']:
-            st.markdown("✅ **動能：** 加速度增強 (紅柱變長)")
-        elif last_row['MACD_Hist'] > 0:
-            st.markdown("⚠️ **動能：** 上漲力道減弱")
-        else:
-            st.markdown("🔴 **動能：** 空頭動能主導")
+    # --- 5. 專業圖表 (Plotly Dark) ---
+    tab1, tab2 = st.tabs(["📈 Price & EMA", "📊 Momentum (MACD)"])
+    
+    with tab1:
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+        
+        # K線 (美股顏色)
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+            name='OHLC',
+            increasing_line_color='#00CC96', decreasing_line_color='#FF4B4B'
+        ), row=1, col=1)
+        
+        # EMA 線 (8=黃, 21=紫)
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_8'], line=dict(color='#FFD700', width=1), name='EMA 8'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_21'], line=dict(color='#9370DB', width=2), name='EMA 21'), row=1, col=1)
+        
+        # 止損線 (紅虛線)
+        fig.add_trace(go.Scatter(x=df.index, y=df['Stop_Loss'], line=dict(color='#FF4B4B', width=1, dash='dot'), name='ATR Stop'), row=1, col=1)
 
         # 成交量
-        if last_row['Volume'] > last_row['Vol_SMA_10'] * 1.2:
-            st.markdown("✅ **資金：** 機構資金進場 (爆量)")
-        else:
-            st.markdown("⚪ **資金：** 交易清淡")
+        colors_vol = ['#00CC96' if row['Close'] >= row['Open'] else '#FF4B4B' for i, row in df.iterrows()]
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors_vol, name='Volume'), row=2, col=1)
+        
+        fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig, use_container_width=True)
+        
+    with tab2:
+        fig_macd = make_subplots(rows=1, cols=1)
+        colors_macd = ['#00CC96' if val >= 0 else '#FF4B4B' for val in df['MACD_Hist']]
+        
+        fig_macd.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=colors_macd, name='Histogram'), row=1, col=1)
+        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Line'], line=dict(color='#FFD700'), name='MACD'), row=1, col=1)
+        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], line=dict(color='#00BFFF'), name='Signal'), row=1, col=1)
+        
+        fig_macd.update_layout(height=350, template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig_macd, use_container_width=True)
 
-    with c2:
-        st.subheader("📈 價格與趨勢線圖")
-        # 繪製圖表 (包含價格與兩條均線)
-        chart_data = df[['Close', 'EMA_8', 'EMA_21']].tail(60)
-        st.line_chart(chart_data, color=["#ffffff", "#00ff00", "#ff0000"])  # 白=價, 綠=短均, 紅=長均
-
-    # --- 4. 歷史數據表格 (可展開) ---
-    with st.expander("查看最近 5 日詳細數據"):
-        cols_to_show = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'Signal', 'Stop_Loss']
-
-        st.dataframe(
-            df[cols_to_show].tail(5).style.format({
-            'Color': '{:.2f}', 
-            'Volume': '{:.0f}',
-            'EMA_8': '{:.2f}',
-            'EMA_21': '{:.2f}',
-            'MACD_Hist': '{:.2f}',
-            'Stop_Loss': '{:.2f}'
-            })
-            )
-
-
+    # 顯示分析理由
+    with st.expander("查看詳細 AI 分析邏輯 (Analysis Details)", expanded=True):
+        for signal in reasons:
+            st.write(signal)
