@@ -6,265 +6,261 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 
-# --- 1. 頁面設定 (台灣看盤風格) ---
+# --- 1. 頁面設定 (亮色清爽模式) ---
 st.set_page_config(
-    page_title="台股智庫 - Pro Trader Terminal",
-    page_icon="🇹🇼",
+    page_title="US Market Alpha Terminal",
+    page_icon="🇺🇸",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
-# 自定義 CSS (深色模式優化 + 台灣紅漲綠跌)
+# --- 自定義 CSS (亮色主題優化) ---
 st.markdown("""
 <style>
-    .big-font { font-size: 24px !important; font-weight: bold; }
-    .up-color { color: #ff3b30 !important; }
-    .down-color { color: #30d158 !important; }
-    div.stButton > button { width: 100%; }
+    /* 全局背景 - 純白 */
+    .stApp {
+        background-color: #FFFFFF;
+        color: #31333F; /* 深灰字體，閱讀更舒適 */
+    }
+    
+    /* 頂部控制列 - 淺灰底 */
+    .control-panel {
+        background-color: #F8F9FA; /* 淺灰色 */
+        padding: 20px;
+        border-radius: 10px;
+        margin-bottom: 20px;
+        border: 1px solid #DEE2E6;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    /* 數據卡片 - 白底卡片風格 */
+    .metric-card {
+        background-color: #FFFFFF;
+        border: 1px solid #E0E0E0;
+        padding: 15px;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        text-align: center;
+    }
+    
+    /* 美股顏色 (綠漲紅跌) - 加深顏色以適應白底 */
+    .up-color { color: #008000 !important; } /* 深綠 */
+    .down-color { color: #D32F2F !important; } /* 深紅 */
+    
+    /* 按鈕樣式 */
+    div.stButton > button { border-radius: 5px; height: 3em; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 核心數據與策略函數 ---
-@st.cache_data(ttl=300)
-def get_tw_stock_data(ticker):
-    # 台股代號需加上 .TW
-    stock_id = f"{ticker}.TW"
-    
-    # 抓取 1 年數據以計算長均線
-    # 針對剛上市或數據較少的 ETF，加入錯誤處理
+# --- 2. 核心數據函數 ---
+@st.cache_data(ttl=60)
+def get_us_stock_data(ticker, atr_mult):
     try:
-        df = yf.download(stock_id, period="1y", interval="1d", progress=False)
+        df = yf.download(ticker, period="1y", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if len(df) < 50: return None
+
+        # 計算指標
+        df['EMA_8'] = ta.ema(df['Close'], length=8)
+        df['EMA_21'] = ta.ema(df['Close'], length=21)
+        
+        macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
+        if macd is not None:
+            df = pd.concat([df, macd], axis=1)
+            df.rename(columns={
+                df.columns[-3]: 'MACD_Line',
+                df.columns[-2]: 'MACD_Hist',
+                df.columns[-1]: 'MACD_Signal'
+            }, inplace=True)
+
+        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        df['Stop_Loss'] = df['Close'] - (df['ATR'] * atr_mult)
+        df['Vol_SMA_10'] = ta.sma(df['Volume'], length=10)
+        
+        return df
     except Exception:
         return None
-    
-    # 處理 yfinance 可能回傳 MultiIndex 的情況
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    
-    if df.empty:
-        return None
-    
-    # --- 計算台股關鍵指標 ---
-    # 1. 均線系統 (MA)
-    df['MA_5'] = ta.sma(df['Close'], length=5)   # 週線
-    df['MA_20'] = ta.sma(df['Close'], length=20) # 月線 (生命線)
-    df['MA_60'] = ta.sma(df['Close'], length=60) # 季線 (趨勢線)
 
-    # 2. MACD (動能)
-    macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
-    # 確保 MACD 計算成功再合併
-    if macd is not None:
-        df = pd.concat([df, macd], axis=1)
-        # 重新命名欄位以利識別
-        df.rename(columns={
-            df.columns[-3]: 'MACD_Line',
-            df.columns[-2]: 'MACD_Hist',
-            df.columns[-1]: 'MACD_Signal'
-        }, inplace=True)
-    else:
-        # 若數據太少無法計算 MACD，補 0 避免報錯
-        df['MACD_Line'] = 0
-        df['MACD_Hist'] = 0
-        df['MACD_Signal'] = 0
-
-    # 3. 籌碼/量能分析
-    df['Vol_MA_5'] = ta.sma(df['Volume'], length=5)
-    
-    return df
-
-def analyze_strategy(df):
-    if df is None or len(df) < 60:
-        return "數據不足", "gray", ["新上市或數據過少，無法計算技術指標"], 0
-
+def analyze_us_strategy(df):
+    if df is None: return "N/A", "gray", [], 0
     curr = df.iloc[-1]
     prev = df.iloc[-2]
-    
     score = 0
     signals = []
     
-    # --- 經理人邏輯判定 ---
-    
-    # 1. 趨勢判定 (權重 40%)
-    if curr['Close'] > curr['MA_20'] and curr['MA_20'] > curr['MA_60']:
+    # 策略邏輯
+    if curr['Close'] > curr['EMA_8'] and curr['EMA_8'] > curr['EMA_21']:
         score += 40
-        signals.append("✅ 多頭排列 (站穩月季線)")
-    elif curr['Close'] < curr['MA_20']:
-        score -= 20
-        signals.append("⚠️ 跌破月線 (短線轉弱)")
+        signals.append("✅ 強勢多頭 (價格 > EMA8 > EMA21)")
+    elif curr['Close'] < curr['EMA_21']:
+        score -= 30
+        signals.append("⚠️ 跌破 EMA21 (動能消失)")
     else:
-        signals.append("⚪ 均線糾結或盤整")
-        
-    # 2. 動能判定 (權重 30%)
+        signals.append("⚪ 震盪整理中")
+
     if curr['MACD_Hist'] > 0 and curr['MACD_Hist'] > prev['MACD_Hist']:
         score += 30
-        signals.append("✅ MACD 動能增強 (紅柱放大)")
+        signals.append("✅ MACD 動能加速 (紅柱變長)")
     elif curr['MACD_Hist'] < 0:
         score -= 20
-        signals.append("🔴 MACD 空方控盤")
-        
-    # 3. 量能判定 (權重 30%)
-    if curr['Vol_MA_5'] > 0 and curr['Volume'] > curr['Vol_MA_5'] * 1.3:
+        signals.append("🔴 MACD 空方主導")
+
+    vol_ratio = curr['Volume'] / curr['Vol_SMA_10']
+    if vol_ratio > 1.2:
         score += 30
-        signals.append("🔥 爆量攻擊 (資金進場)")
-    elif curr['Vol_MA_5'] > 0 and curr['Volume'] < curr['Vol_MA_5'] * 0.7:
-        signals.append("⚪ 量縮整理")
-
-    # 綜合建議
+        signals.append(f"🔥 爆量攻擊 (量增 {vol_ratio:.1f}x)")
+    
+    # 配色 (白底適用深色字) - 【修正處：補回 reasons 和 score】
     if score >= 70:
-        action = "積極買進 (Strong Buy)"
-        color = "red"
-    elif score >= 30:
-        action = "區間操作 / 續抱 (Hold)"
-        color = "orange"
+        return "STRONG BUY (積極買進)", "#008000", reasons, score
+    elif score <= 20:
+        return "SELL / EXIT (止損離場)", "#D32F2F", reasons, score
     else:
-        action = "減碼 / 觀望 (Sell/Avoid)"
-        color = "green"
-        
-    return action, color, signals, score
+        return "HOLD (續抱/觀望)", "#FF8C00", reasons, score
 
-# --- 新增功能：發送 LINE 通知 ---
 def send_line_notify(token, message):
     url = "https://notify-api.line.me/api/notify"
     headers = {"Authorization": "Bearer " + token}
     data = {"message": message}
     try:
-        r = requests.post(url, headers=headers, data=data)
-        return r.status_code == 200
-    except Exception:
+        requests.post(url, headers=headers, data=data)
+        return True
+    except:
         return False
 
-# --- 3. UI 介面設計 ---
+# --- 3. UI 佈局 ---
+st.title("🇺🇸 US Market Alpha Terminal")
 
-# 側邊欄
-with st.sidebar:
-    st.title("🇹🇼 台股戰情室")
-    st.markdown("---")
+# Top Control Bar (Light Theme)
+with st.container():
+    st.markdown('<div class="control-panel">', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1.5, 1.5, 2])
     
-    # 【更新重點】這裡加入了您要求的股票清單
-    stock_options = [
-        "0050 元大台灣50", 
-        "0056 元大高股息", 
-        "00737 國泰AI+Robo", 
-        "2330 台積電"
-    ]
-    
-    target = st.radio("選擇標的", stock_options)
-    ticker = target.split(" ")[0]
-    
-    st.markdown("---")
-    st.header("🔔 LINE 通知設定")
-    line_token = st.text_input("輸入 LINE Notify Token", type="password", help="請至 LINE Notify 官網申請權杖")
-    
-    st.info("""
-    **經理人觀點：**
-    * 0050/2330：看外資動向與季線
-    * 0056：看殖利率與月線支撐
-    * 00737：看AI產業動能與美股連動
-    """)
+    with c1:
+        ticker_list = sorted([
+            "AAPL", "AMD", "AVGO", "APP", "ASML", "GOOG", "HIMS", "INTC", 
+            "LLY", "LRCX", "MSFT", "TSM", "NVDA", "ORCL", "PLTR", 
+            "QQQ", "SPY", "TEM", "TSLA", "XLV"
+        ])
+        selected_ticker = st.selectbox("選擇股票 (Symbol)", ticker_list)
+        
+    with c2:
+        atr_mult = st.slider("ATR 止損係數", 1.5, 4.0, 2.5, 0.1)
+        
+    with c3:
+        line_token = st.text_input("LINE Notify Token", type="password", placeholder="貼上 Token 以啟用通知")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# 主畫面
-st.header(f"📊 {target} 專業技術分析")
-
-# 獲取數據
-df = get_tw_stock_data(ticker)
+# --- 4. 主數據顯示 ---
+df = get_us_stock_data(selected_ticker, atr_mult)
 
 if df is None:
-    st.error(f"❌ 無法取得 {ticker} 數據，請確認代號是否正確或檢查網路連線。")
+    st.error(f"❌ 無法取得 {selected_ticker} 數據，請稍後再試。")
 else:
     last_row = df.iloc[-1]
     prev_row = df.iloc[-2]
-
-    # 計算漲跌
+    
     change = last_row['Close'] - prev_row['Close']
     pct_change = (change / prev_row['Close']) * 100
-    price_color = "#ff3b30" if change >= 0 else "#30d158" # 紅漲綠跌
-    arrow = "▲" if change >= 0 else "▼"
-
-    # 顯示價格看板
-    col1, col2, col3 = st.columns([1.5, 2, 1.5])
-
-    with col1:
+    # 白底適用的深色
+    price_color = "#008000" if change >= 0 else "#D32F2F"
+    
+    # 這裡就是原本報錯的地方，現在修好了
+    action, action_color, reasons, score = analyze_us_strategy(df)
+    
+    # Metrics
+    m1, m2, m3, m4 = st.columns(4)
+    
+    with m1:
         st.markdown(f"""
-        <div style='text-align: center; border: 1px solid #ddd; padding: 10px; border-radius: 10px;'>
-            <div style='font-size: 16px; color: gray;'>目前股價</div>
-            <div style='font-size: 36px; font-weight: bold; color: {price_color};'>
-                {last_row['Close']:.2f} <span style='font-size: 20px;'>{arrow} {abs(change):.2f} ({pct_change:.2f}%)</span>
+        <div class="metric-card">
+            <div style="color:#666; font-size:14px;">Current Price</div>
+            <div style="font-size:28px; font-weight:bold; color:{price_color};">
+                ${last_row['Close']:.2f}
+            </div>
+            <div style="color:{price_color}; font-size:16px;">
+                {change:+.2f} ({pct_change:+.2f}%)
             </div>
         </div>
         """, unsafe_allow_html=True)
-
-    # 執行策略分析
-    action, action_color, reasons, total_score = analyze_strategy(df)
-
-    # 定義 CSS 顏色變數供 f-string 使用
-    css_color = "red" if action_color == "red" else "orange" if action_color == "orange" else "green"
-
-    with col2:
-        st.markdown(f"""
-        <div style='text-align: center; background-color: #f0f2f6; padding: 10px; border-radius: 10px;'>
-            <div style='font-size: 16px; color: gray;'>AI 經理人建議</div>
-            <div style='font-size: 28px; font-weight: bold; color: {css_color};'>{action}</div>
-            <div style='font-size: 14px;'>綜合評分: {total_score}/100</div>
+        
+    with m2:
+         st.markdown(f"""
+        <div class="metric-card">
+            <div style="color:#666; font-size:14px;">AI Signal</div>
+            <div style="font-size:24px; font-weight:bold; color:{action_color};">
+                {action.split(' ')[0]}
+            </div>
+            <div style="color:#888; font-size:14px;">Score: {score}/100</div>
         </div>
         """, unsafe_allow_html=True)
 
-    with col3:
-        st.metric("月線 (生命線)", f"{last_row['MA_20']:.2f}", delta=f"{last_row['Close'] - last_row['MA_20']:.2f}")
-        st.metric("季線 (趨勢線)", f"{last_row['MA_60']:.2f}")
+    with m3:
+        risk = last_row['Close'] - last_row['Stop_Loss']
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="color:#666; font-size:14px;">Stop Loss (ATR)</div>
+            <div style="font-size:28px; font-weight:bold; color:#D32F2F;">
+                ${last_row['Stop_Loss']:.2f}
+            </div>
+            <div style="color:#888; font-size:14px;">Risk: ${risk:.2f}/share</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # LINE 發送按鈕
-    st.markdown("---")
-    if st.button("📲 發送 LINE 戰報", type="primary", disabled=not line_token):
-        if not line_token:
-            st.error("請先在側邊欄輸入 LINE Token")
-        else:
-            msg = f"\n【台股戰情室】\n標的：{target}\n現價：{last_row['Close']:.2f}\n建議：{action}\n評分：{total_score}\n關鍵：\n"
-            for r in reasons:
-                msg += f"• {r}\n"
-            
-            if send_line_notify(line_token, msg):
-                st.toast("✅ 戰報已發送！", icon="🚀")
+    with m4:
+        st.write("") 
+        if st.button("📲 發送訊號到 LINE", type="primary", use_container_width=True, disabled=not line_token):
+            if not line_token:
+                st.error("Missing Token")
             else:
-                st.error("發送失敗")
+                msg = f"\n🇺🇸【美股快訊】\n標的：{selected_ticker}\n現價：${last_row['Close']:.2f}\n訊號：{action}\n止損：${last_row['Stop_Loss']:.2f}"
+                if send_line_notify(line_token, msg):
+                    st.toast("Sent successfully!", icon="✅")
 
-    st.markdown("---")
+    st.write("") 
 
-    # --- 4. 繪製 K 線圖 (Plotly) ---
-    tab1, tab2 = st.tabs(["📈 K線主圖", "📊 MACD 動能"])
-
+    # --- 5. 專業圖表 (Plotly White) ---
+    tab1, tab2 = st.tabs(["📈 Price & EMA", "📊 Momentum (MACD)"])
+    
     with tab1:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                            vertical_spacing=0.05, row_heights=[0.7, 0.3],
-                            subplot_titles=('股價 & 均線', '成交量'))
-
-        # K棒
-        candlestick = go.Candlestick(
-            x=df.index,
-            open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-            name='K線',
-            increasing_line_color='#ff3b30', decreasing_line_color='#30d158'
-        )
-        fig.add_trace(candlestick, row=1, col=1)
-
-        # 均線
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA_5'], line=dict(color='orange', width=1), name='5日線'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA_20'], line=dict(color='purple', width=2), name='20日線'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA_60'], line=dict(color='blue', width=2), name='60日線'), row=1, col=1)
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+        
+        # K線 (美股顏色)
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+            name='OHLC',
+            increasing_line_color='#008000', decreasing_line_color='#D32F2F'
+        ), row=1, col=1)
+        
+        # EMA 線 (8=橘, 21=藍) - 白底上對比度好的顏色
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_8'], line=dict(color='#FFA500', width=1), name='EMA 8'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_21'], line=dict(color='#007BFF', width=2), name='EMA 21'), row=1, col=1)
+        
+        # 止損線 (紅虛線)
+        fig.add_trace(go.Scatter(x=df.index, y=df['Stop_Loss'], line=dict(color='#D32F2F', width=1, dash='dot'), name='ATR Stop'), row=1, col=1)
 
         # 成交量
-        colors = ['#ff3b30' if row['Open'] < row['Close'] else '#30d158' for index, row in df.iterrows()]
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
+        colors_vol = ['#008000' if row['Close'] >= row['Open'] else '#D32F2F' for i, row in df.iterrows()]
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors_vol, name='Volume'), row=2, col=1)
         
-        fig.update_layout(height=600, xaxis_rangeslider_visible=False)
+        # ⚠️ 關鍵：使用 plotly_white 模板
+        fig.update_layout(height=600, template="plotly_white", xaxis_rangeslider_visible=False, 
+                          paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig, use_container_width=True)
-
-    with tab2:
-        st.subheader("MACD 動能分析")
-        fig_macd = make_subplots(rows=1, cols=1)
-        colors_macd = ['#ff3b30' if val >= 0 else '#30d158' for val in df['MACD_Hist']]
-        fig_macd.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=colors_macd, name='柱狀體'), row=1, col=1)
-        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Line'], line=dict(color='orange'), name='DIF'), row=1, col=1)
-        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], line=dict(color='blue'), name='DEM'), row=1, col=1)
         
-        fig_macd.update_layout(height=300)
+    with tab2:
+        fig_macd = make_subplots(rows=1, cols=1)
+        colors_macd = ['#008000' if val >= 0 else '#D32F2F' for val in df['MACD_Hist']]
+        
+        fig_macd.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=colors_macd, name='Histogram'), row=1, col=1)
+        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Line'], line=dict(color='#FFA500'), name='MACD'), row=1, col=1)
+        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], line=dict(color='#007BFF'), name='Signal'), row=1, col=1)
+        
+        fig_macd.update_layout(height=350, template="plotly_white", 
+                               paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig_macd, use_container_width=True)
+
+    with st.expander("查看詳細 AI 分析邏輯 (Analysis Details)", expanded=True):
+        for signal in reasons:
+            st.write(signal)
