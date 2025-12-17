@@ -111,13 +111,13 @@ def analyze_us_strategy(df):
         score += 30
         signals.append(f"🔥 爆量攻擊 (量增 {vol_ratio:.1f}x)")
     
-    # 配色 (白底適用深色字)
+    # 配色 (白底適用深色字) - 【修正處：補回 reasons 和 score】
     if score >= 70:
-        return "STRONG BUY (積極買進)", "#008000" 
+        return "STRONG BUY (積極買進)", "#008000", reasons, score
     elif score <= 20:
-        return "SELL / EXIT (止損離場)", "#D32F2F"
+        return "SELL / EXIT (止損離場)", "#D32F2F", reasons, score
     else:
-        return "HOLD (續抱/觀望)", "#FF8C00"
+        return "HOLD (續抱/觀望)", "#FF8C00", reasons, score
 
 def send_line_notify(token, message):
     url = "https://notify-api.line.me/api/notify"
@@ -166,6 +166,7 @@ else:
     # 白底適用的深色
     price_color = "#008000" if change >= 0 else "#D32F2F"
     
+    # 這裡就是原本報錯的地方，現在修好了
     action, action_color, reasons, score = analyze_us_strategy(df)
     
     # Metrics
@@ -237,29 +238,4 @@ else:
         fig.add_trace(go.Scatter(x=df.index, y=df['EMA_21'], line=dict(color='#007BFF', width=2), name='EMA 21'), row=1, col=1)
         
         # 止損線 (紅虛線)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Stop_Loss'], line=dict(color='#D32F2F', width=1, dash='dot'), name='ATR Stop'), row=1, col=1)
-
-        # 成交量
-        colors_vol = ['#008000' if row['Close'] >= row['Open'] else '#D32F2F' for i, row in df.iterrows()]
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors_vol, name='Volume'), row=2, col=1)
-        
-        # ⚠️ 關鍵：使用 plotly_white 模板
-        fig.update_layout(height=600, template="plotly_white", xaxis_rangeslider_visible=False, 
-                          paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
-        
-    with tab2:
-        fig_macd = make_subplots(rows=1, cols=1)
-        colors_macd = ['#008000' if val >= 0 else '#D32F2F' for val in df['MACD_Hist']]
-        
-        fig_macd.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=colors_macd, name='Histogram'), row=1, col=1)
-        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Line'], line=dict(color='#FFA500'), name='MACD'), row=1, col=1)
-        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], line=dict(color='#007BFF'), name='Signal'), row=1, col=1)
-        
-        fig_macd.update_layout(height=350, template="plotly_white", 
-                               paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig_macd, use_container_width=True)
-
-    with st.expander("查看詳細 AI 分析邏輯 (Analysis Details)", expanded=True):
-        for signal in reasons:
-            st.write(signal)
+        fig.add_trace(go.Scatter(x=df.index, y=df['Stop_Loss'], line=dict(color='#D32F2F', width=1, dash='dot'), name='ATR Stop'), row=
