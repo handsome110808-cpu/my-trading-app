@@ -20,12 +20,12 @@ st.markdown("""
     /* 全局背景 - 純白 */
     .stApp {
         background-color: #FFFFFF;
-        color: #31333F; /* 深灰字體，閱讀更舒適 */
+        color: #31333F; /* 深灰字體 */
     }
     
     /* 頂部控制列 - 淺灰底 */
     .control-panel {
-        background-color: #F8F9FA; /* 淺灰色 */
+        background-color: #F8F9FA;
         padding: 20px;
         border-radius: 10px;
         margin-bottom: 20px;
@@ -43,9 +43,9 @@ st.markdown("""
         text-align: center;
     }
     
-    /* 美股顏色 (綠漲紅跌) - 加深顏色以適應白底 */
-    .up-color { color: #008000 !important; } /* 深綠 */
-    .down-color { color: #D32F2F !important; } /* 深紅 */
+    /* 美股顏色 (綠漲紅跌) */
+    .up-color { color: #008000 !important; }
+    .down-color { color: #D32F2F !important; }
     
     /* 按鈕樣式 */
     div.stButton > button { border-radius: 5px; height: 3em; }
@@ -87,7 +87,7 @@ def analyze_us_strategy(df):
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     score = 0
-    signals = []
+    signals = []  # 變數定義在這裡叫 signals
     
     # 策略邏輯
     if curr['Close'] > curr['EMA_8'] and curr['EMA_8'] > curr['EMA_21']:
@@ -111,13 +111,13 @@ def analyze_us_strategy(df):
         score += 30
         signals.append(f"🔥 爆量攻擊 (量增 {vol_ratio:.1f}x)")
     
-    # 配色 (白底適用深色字) - 【修正處：補回 reasons 和 score】
+    # 【修正重點】：這裡原本錯誤寫成 reasons，現在改回 signals
     if score >= 70:
-        return "STRONG BUY (積極買進)", "#008000", reasons, score
+        return "STRONG BUY (積極買進)", "#008000", signals, score
     elif score <= 20:
-        return "SELL / EXIT (止損離場)", "#D32F2F", reasons, score
+        return "SELL / EXIT (止損離場)", "#D32F2F", signals, score
     else:
-        return "HOLD (續抱/觀望)", "#FF8C00", reasons, score
+        return "HOLD (續抱/觀望)", "#FF8C00", signals, score
 
 def send_line_notify(token, message):
     url = "https://notify-api.line.me/api/notify"
@@ -132,7 +132,7 @@ def send_line_notify(token, message):
 # --- 3. UI 佈局 ---
 st.title("🇺🇸 US Market Alpha Terminal")
 
-# Top Control Bar (Light Theme)
+# Top Control Bar
 with st.container():
     st.markdown('<div class="control-panel">', unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1.5, 1.5, 2])
@@ -163,10 +163,9 @@ else:
     
     change = last_row['Close'] - prev_row['Close']
     pct_change = (change / prev_row['Close']) * 100
-    # 白底適用的深色
     price_color = "#008000" if change >= 0 else "#D32F2F"
     
-    # 這裡就是原本報錯的地方，現在修好了
+    # 這裡現在會正確接收到 signals
     action, action_color, reasons, score = analyze_us_strategy(df)
     
     # Metrics
@@ -226,41 +225,14 @@ else:
     with tab1:
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
         
-        # K線 (美股顏色)
         fig.add_trace(go.Candlestick(
             x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
             name='OHLC',
             increasing_line_color='#008000', decreasing_line_color='#D32F2F'
         ), row=1, col=1)
         
-        # EMA 線 (8=橘, 21=藍) - 白底上對比度好的顏色
         fig.add_trace(go.Scatter(x=df.index, y=df['EMA_8'], line=dict(color='#FFA500', width=1), name='EMA 8'), row=1, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=df['EMA_21'], line=dict(color='#007BFF', width=2), name='EMA 21'), row=1, col=1)
-        
-        # 止損線 (紅虛線)
         fig.add_trace(go.Scatter(x=df.index, y=df['Stop_Loss'], line=dict(color='#D32F2F', width=1, dash='dot'), name='ATR Stop'), row=1, col=1)
 
-        # 成交量
-        colors_vol = ['#008000' if row['Close'] >= row['Open'] else '#D32F2F' for i, row in df.iterrows()]
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors_vol, name='Volume'), row=2, col=1)
-        
-        # ⚠️ 關鍵：使用 plotly_white 模板
-        fig.update_layout(height=600, template="plotly_white", xaxis_rangeslider_visible=False, 
-                          paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
-        
-    with tab2:
-        fig_macd = make_subplots(rows=1, cols=1)
-        colors_macd = ['#008000' if val >= 0 else '#D32F2F' for val in df['MACD_Hist']]
-        
-        fig_macd.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=colors_macd, name='Histogram'), row=1, col=1)
-        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Line'], line=dict(color='#FFA500'), name='MACD'), row=1, col=1)
-        fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], line=dict(color='#007BFF'), name='Signal'), row=1, col=1)
-        
-        fig_macd.update_layout(height=350, template="plotly_white", 
-                               paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig_macd, use_container_width=True)
-
-    with st.expander("查看詳細 AI 分析邏輯 (Analysis Details)", expanded=True):
-        for signal in reasons:
-            st.write(signal)
+        colors_vol = ['#008000'
