@@ -74,7 +74,7 @@ def save_snapshot(ticker, price, pc_data):
 
 # --- 4. 核心運算邏輯 ---
 def calculate_technical_indicators(df, atr_mult):
-    """共用的技術指標與訊號計算邏輯"""
+    """共用的技術指標計算邏輯"""
     if len(df) < 50: return df, "數據不足"
     df = df.ffill()
 
@@ -97,25 +97,12 @@ def calculate_technical_indicators(df, atr_mult):
     df['RSI'] = ta.rsi(df['Close'], length=14)
     df['Stop_Loss'] = df['Close'] - (df['ATR'] * atr_mult)
 
-    # 訊號判定邏輯 (對應三種狀態)
-    # 強力多頭 (BUY)
-    conditions = [
-        (df['Close'] > df['EMA_8']) & 
-        (df['EMA_8'] > df['EMA_21']) & 
-        (df['MACD_Hist'] > 0) & 
-        (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) & 
-        (df['Volume'] > df['Vol_SMA_10'] * 1.2)
-    ]
-    df['Signal'] = np.select(conditions, ['強力多頭'], default='震盪')
-    
-    # 強力空頭 (SELL)
-    sell_cond = (df['Close'] < df['EMA_21']) | (df['MACD_Hist'] < 0)
-    df.loc[sell_cond, 'Signal'] = '強力空頭'
-    
+    # 這裡只做基礎計算，詳細訊號判定交由各個功能模組處理
     return df, None
 
 @st.cache_data(ttl=60)
 def get_signal(ticker, atr_mult):
+    """單一股票詳細分析 (包含 Signal 欄位)"""
     try:
         df = yf.download(ticker, period="6mo", progress=False)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
@@ -126,17 +113,34 @@ def get_signal(ticker, atr_mult):
 
         df, err = calculate_technical_indicators(df, atr_mult)
         if err: return None, err
+        
+        # 為了相容舊版單一股票分析的顯示，這裡保留一個簡單的 Signal 欄位
+        conditions = [
+            (df['Close'] > df['EMA_8']) & (df['EMA_8'] > df['EMA_21']) & 
+            (df['MACD_Hist'] > 0)
+        ]
+        df['Signal'] = np.select(conditions, ['BUY'], default='HOLD')
+        sell_cond = (df['Close'] < df['EMA_21']) | (df['MACD_Hist'] < 0)
+        df.loc[sell_cond, 'Signal'] = 'SELL'
+
         return df, None
     except Exception as e: return None, str(e)
 
 @st.cache_data(ttl=60)
-def scan_market_summary(tickers, atr_mult):
-    """批次掃描全市場訊號"""
-    # 儲存結構改為存放詳細資訊的列表
-    summary = {"強力多頭": [], "震盪": [], "強力空頭": []}
+def scan_market_summary_advanced(tickers, atr_mult):
+    """
+    批次掃描全市場，並依據 5 種狀態進行分類
+    分類標準：加權計分法 (Weighted Scoring)
+    """
+    summary = {
+        "強力多頭": [],
+        "偏多震盪": [],
+        "多空平衡": [],
+        "偏空震盪": [],
+        "強力空頭": []
+    }
     
     try:
-        # 批次下載
         data = yf.download(tickers, period="3mo", group_by='ticker', progress=False, threads=True)
         
         for ticker in tickers:
@@ -146,23 +150,46 @@ def scan_market_summary(tickers, atr_mult):
                     if pd.isna(df_t.iloc[-1]['Close']): df_t = df_t.iloc[:-1]
                 if df_t.empty: continue
                 
-                # 計算訊號
+                # 計算指標
                 df_t, err = calculate_technical_indicators(df_t, atr_mult)
                 if err: continue
                 
-                last_row = df_t.iloc[-1]
-                last_sig = last_row['Signal']
+                row = df_t.iloc[-1]
+                prev = df_t.iloc[-2]
                 
-                # 準備顯示字串：代碼 + 價格 + 漲跌
+                # === 評分核心邏輯 ===
+                score = 0
+                
+                # 1. 均線趨勢 (權重 2)
+                if row['Close'] > row['EMA_8'] > row['EMA_21']: score += 2
+                elif row['Close'] < row['EMA_21']: score -= 2
+                
+                # 2. MACD 動能 (權重 1)
+                if row['MACD_Hist'] > 0 and row['MACD_Hist'] > prev['MACD_Hist']: score += 1
+                elif row['MACD_Hist'] < 0 and row['MACD_Hist'] < prev['MACD_Hist']: score -= 1
+                
+                # 3. RSI 強度 (權重 1)
+                if row['RSI'] > 55: score += 1
+                elif row['RSI'] < 45: score -= 1
+                
+                # 4. 量能 (權重 1)
+                vol_up = row['Volume'] > row['Vol_SMA_10'] * 1.2
+                if vol_up and row['Close'] > row['Open']: score += 1 # 爆量漲
+                elif vol_up and row['Close'] < row['Open']: score -= 1 # 爆量跌
+                
+                # === 分類判定 ===
+                category = "多空平衡"
+                if score >= 3: category = "強力多頭"
+                elif 1 <= score <= 2: category = "偏多震盪"
+                elif -2 <= score <= -1: category = "偏空震盪"
+                elif score <= -3: category = "強力空頭"
+                
+                # 準備顯示字串
                 prev_close = df_t.iloc[-2]['Close']
-                pct_chg = ((last_row['Close'] - prev_close) / prev_close) * 100
-                display_str = f"{ticker} (${last_row['Close']:.2f} | {pct_chg:+.2f}%)"
+                pct_chg = ((row['Close'] - prev_close) / prev_close) * 100
+                display_str = f"{ticker} (${row['Close']:.2f} | {pct_chg:+.2f}%)"
                 
-                # 分類
-                if last_sig in summary:
-                    summary[last_sig].append(display_str)
-                else:
-                    summary["震盪"].append(display_str) # 預設
+                summary[category].append(display_str)
                     
             except: continue
     except Exception as e: return None
@@ -317,7 +344,6 @@ if error:
 else:
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    # 更新 Signal 顯示文字
     signal = last['Signal']
     
     # 期權與存檔邏輯
@@ -338,10 +364,16 @@ else:
 
     sentiment, analysis_report = get_comprehensive_analysis(last, prev, pc_data)
 
-    # 頂部狀態
-    if signal == '強力多頭': st.success(f"🔥 {selected_ticker} 訊號：強力多頭 (STRONG BUY)")
-    elif signal == '強力空頭': st.error(f"🛑 {selected_ticker} 訊號：強力空頭 (STRONG SELL)")
-    else: st.info(f"👀 {selected_ticker} 訊號：震盪整理 (OSCILLATION)")
+    # 頂部狀態 (顯示新版 AI 判斷的 sentiment)
+    # 提取純文字部分 (例如 "🚀 強力多頭")
+    sent_text = sentiment.split(' ')[1] if len(sentiment.split(' ')) > 1 else sentiment
+    
+    if "多頭" in sent_text:
+        st.success(f"🔥 {selected_ticker} 訊號：{sentiment}")
+    elif "空頭" in sent_text:
+        st.error(f"🛑 {selected_ticker} 訊號：{sentiment}")
+    else:
+        st.info(f"👀 {selected_ticker} 訊號：{sentiment}")
 
     # KPI
     k1, k2, k3, k4 = st.columns(4)
@@ -366,7 +398,7 @@ else:
         <div class="analysis-box" style="text-align:center; height: 100%;">
             <h3 style="margin-bottom:0;">總結趨勢</h3>
             <h1 style="font-size: 3em; margin: 10px 0;">{sentiment.split(' ')[0]}</h1>
-            <h4 style="color: #666;">{sentiment.split(' ')[1]}</h4>
+            <h4 style="color: #666;">{sentiment.split(' ')[1] if len(sentiment.split(' '))>1 else sentiment}</h4>
             <hr>
             <p style="font-size: 0.9em; color: #888;">基於 期權、均線、MACD、RSI、量價 綜合運算</p>
         </div>
@@ -410,53 +442,67 @@ else:
 st.markdown("---")
 st.subheader("🌍 全市場戰情選股 (Market Screener)")
 
-with st.spinner("正在掃描全市場訊號..."):
-    market_signals = scan_market_summary(TARGET_TICKERS, atr_multiplier)
+with st.spinner("正在執行 AI 全市場多因子掃描..."):
+    market_signals = scan_market_summary_advanced(TARGET_TICKERS, atr_multiplier)
 
 if market_signals:
-    # 建立選股濾網 UI
+    # 建立選股濾網 UI (更新為 5 種分類)
     filter_option = st.selectbox(
         "🔍 選擇市場狀態進行篩選：",
-        ["全部顯示 (All)", "強力多頭 (Strong Bull)", "震盪 (Oscillation)", "強力空頭 (Strong Bear)"]
+        [
+            "全部顯示 (All)",
+            "強力多頭 (Strong Bull) - 評分 >= 3",
+            "偏多震盪 (Bullish Oscillation) - 評分 1~2",
+            "多空平衡 (Balanced) - 評分 0",
+            "偏空震盪 (Bearish Oscillation) - 評分 -1~-2",
+            "強力空頭 (Strong Bear) - 評分 <= -3"
+        ]
     )
     
     st.markdown("<br>", unsafe_allow_html=True)
     
-    # 根據選擇顯示結果
+    # 映射選項到字典 key
+    key_map = {
+        "強力多頭 (Strong Bull) - 評分 >= 3": "強力多頭",
+        "偏多震盪 (Bullish Oscillation) - 評分 1~2": "偏多震盪",
+        "多空平衡 (Balanced) - 評分 0": "多空平衡",
+        "偏空震盪 (Bearish Oscillation) - 評分 -1~-2": "偏空震盪",
+        "強力空頭 (Strong Bear) - 評分 <= -3": "強力空頭"
+    }
+    
     if filter_option == "全部顯示 (All)":
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.info(f"🐂 強力多頭 ({len(market_signals['強力多頭'])})")
-            for item in market_signals['強力多頭']: st.write(item)
-        with col2:
-            st.warning(f"⚖️ 震盪整理 ({len(market_signals['震盪'])})")
-            for item in market_signals['震盪']: st.write(item)
-        with col3:
-            st.error(f"🐻 強力空頭 ({len(market_signals['強力空頭'])})")
-            for item in market_signals['強力空頭']: st.write(item)
+        # 顯示五欄
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            st.success(f"🚀 強力多頭 ({len(market_signals['強力多頭'])})")
+            for i in market_signals['強力多頭']: st.write(i)
+        with c2:
+            st.info(f"📈 偏多震盪 ({len(market_signals['偏多震盪'])})")
+            for i in market_signals['偏多震盪']: st.write(i)
+        with c3:
+            st.warning(f"⚖️ 多空平衡 ({len(market_signals['多空平衡'])})")
+            for i in market_signals['多空平衡']: st.write(i)
+        with c4:
+            st.write(f"📉 偏空震盪 ({len(market_signals['偏空震盪'])})")
+            for i in market_signals['偏空震盪']: st.write(i)
+        with c5:
+            st.error(f"🩸 強力空頭 ({len(market_signals['強力空頭'])})")
+            for i in market_signals['強力空頭']: st.write(i)
             
-    elif filter_option == "強力多頭 (Strong Bull)":
-        st.success(f"🐂 目前符合「強力多頭」條件的股票 ({len(market_signals['強力多頭'])})：")
-        if market_signals['強力多頭']:
-            # 轉成 DataFrame 顯示更漂亮
-            df_bull = pd.DataFrame(market_signals['強力多頭'], columns=["股票代碼 / 價格"])
-            st.dataframe(df_bull, use_container_width=True, hide_index=True)
-        else:
-            st.write("目前無符合標的。")
-            
-    elif filter_option == "震盪 (Oscillation)":
-        st.warning(f"⚖️ 目前處於「震盪整理」的股票 ({len(market_signals['震盪'])})：")
-        if market_signals['震盪']:
-            df_osc = pd.DataFrame(market_signals['震盪'], columns=["股票代碼 / 價格"])
-            st.dataframe(df_osc, use_container_width=True, hide_index=True)
-        else:
-            st.write("目前無符合標的。")
-            
-    elif filter_option == "強力空頭 (Strong Bear)":
-        st.error(f"🐻 目前符合「強力空頭」條件的股票 ({len(market_signals['強力空頭'])})：")
-        if market_signals['強力空頭']:
-            df_bear = pd.DataFrame(market_signals['強力空頭'], columns=["股票代碼 / 價格"])
-            st.dataframe(df_bear, use_container_width=True, hide_index=True)
+    else:
+        target_key = key_map[filter_option]
+        result_list = market_signals[target_key]
+        
+        # 顏色設定
+        if "多頭" in target_key: msg_func = st.success
+        elif "空頭" in target_key: msg_func = st.error
+        else: msg_func = st.warning
+        
+        msg_func(f"目前符合「{target_key}」條件的股票 ({len(result_list)})：")
+        
+        if result_list:
+            df_res = pd.DataFrame(result_list, columns=["股票代碼 / 價格"])
+            st.dataframe(df_res, use_container_width=True, hide_index=True)
         else:
             st.write("目前無符合標的。")
 
