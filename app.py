@@ -8,6 +8,8 @@ import time
 import pytz
 import json
 import os
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # --- 1. 網頁設定 ---
 st.set_page_config(
@@ -28,15 +30,12 @@ st.markdown("""
     
     /* 總表樣式優化 */
     .summary-header { font-size: 20px; font-weight: bold; margin-bottom: 10px; text-align: center; }
-    .status-buy { color: #00c853; font-weight: bold; }
-    .status-sell { color: #d50000; font-weight: bold; }
-    .status-hold { color: #ffab00; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. 資料存取與快照功能 ---
+# --- 3. 全域設定與快照功能 ---
 SNAPSHOT_FILE = 'options_history.json'
-# 定義目標股票清單 (全域變數)
+# 指定的目標股票清單
 TARGET_TICKERS = sorted([
     "AAPL", "AMD", "APP", "ASML", "AVGO", "GOOG", "HIMS", "INTC",
     "LLY", "LRCX", "MSFT", "MU", "NBIS", "NVDA", "ORCL", "PLTR",
@@ -73,7 +72,7 @@ def calculate_technical_indicators(df, atr_mult):
     # 確保數據足夠
     if len(df) < 50: return df, "數據不足"
     
-    # 填補空值以免計算錯誤
+    # 填補空值
     df = df.ffill()
 
     # 計算指標
@@ -83,9 +82,13 @@ def calculate_technical_indicators(df, atr_mult):
     macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
     if macd is not None:
         df = pd.concat([df, macd], axis=1)
-        # 重新命名欄位
-        cols = {df.columns[-3]: 'MACD_Line', df.columns[-2]: 'MACD_Hist', df.columns[-1]: 'MACD_Signal'}
-        df.rename(columns=cols, inplace=True)
+        # 重新命名欄位，避免後續抓不到
+        cols_map = {
+            df.columns[-3]: 'MACD_Line', 
+            df.columns[-2]: 'MACD_Hist', 
+            df.columns[-1]: 'MACD_Signal'
+        }
+        df.rename(columns=cols_map, inplace=True)
 
     df['Vol_SMA_10'] = ta.sma(df['Volume'], length=10)
     df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
@@ -115,6 +118,7 @@ def get_signal(ticker, atr_mult):
         df = yf.download(ticker, period="6mo", progress=False)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         
+        # 處理非交易時段的空數據
         if len(df) > 0:
             last_row = df.iloc[-1]
             if pd.isna(last_row['Close']) or pd.isna(last_row['Open']): df = df.iloc[:-1]
@@ -133,7 +137,7 @@ def scan_market_summary(tickers, atr_mult):
     summary = {"BUY": [], "HOLD": [], "SELL": []}
     
     try:
-        # 批次下載，效能優化
+        # 批次下載，使用 group_by='ticker' 方便後續處理
         data = yf.download(tickers, period="3mo", group_by='ticker', progress=False, threads=True)
         
         for ticker in tickers:
@@ -297,9 +301,21 @@ else:
             st.dataframe(pd.DataFrame(pc_data['details']).head(3), hide_index=True, use_container_width=True)
         else: st.warning("無資料")
 
+    # --- 歷史表格 (已修復 ValueError) ---
     with st.expander("查看技術數據"):
-        cols = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'Signal', 'Stop_Loss']
-        st.dataframe(df[cols].tail(5).style.format("{:.2f}"))
+        cols_to_show = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'Signal', 'Stop_Loss']
+        
+        # 關鍵修正：針對數字欄位設定格式，避開文字欄位 'Signal'
+        format_dict = {
+            'Close': '{:.2f}',
+            'Volume': '{:.0f}',
+            'EMA_8': '{:.2f}',
+            'EMA_21': '{:.2f}',
+            'MACD_Hist': '{:.2f}',
+            'Stop_Loss': '{:.2f}'
+        }
+        
+        st.dataframe(df[cols_to_show].tail(5).style.format(format_dict))
 
 # === B. 全市場訊號彙整總表 ===
 st.markdown("---")
@@ -311,7 +327,6 @@ with st.spinner("正在掃描市場訊號..."):
 
 if market_signals:
     # 整理資料為 DataFrame 格式以便顯示
-    # 找出最大長度以填補空值
     max_len = max(len(market_signals["BUY"]), len(market_signals["HOLD"]), len(market_signals["SELL"]))
     
     # 補齊長度
