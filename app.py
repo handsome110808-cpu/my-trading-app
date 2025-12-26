@@ -94,10 +94,11 @@ def calculate_technical_indicators(df, atr_mult):
 
     df['Vol_SMA_10'] = ta.sma(df['Volume'], length=10)
     df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-    df['RSI'] = ta.rsi(df['Close'], length=14) # 新增 RSI
+    df['RSI'] = ta.rsi(df['Close'], length=14)
     df['Stop_Loss'] = df['Close'] - (df['ATR'] * atr_mult)
 
-    # 訊號判定邏輯
+    # 訊號判定邏輯 (對應三種狀態)
+    # 強力多頭 (BUY)
     conditions = [
         (df['Close'] > df['EMA_8']) & 
         (df['EMA_8'] > df['EMA_21']) & 
@@ -105,10 +106,11 @@ def calculate_technical_indicators(df, atr_mult):
         (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) & 
         (df['Volume'] > df['Vol_SMA_10'] * 1.2)
     ]
-    df['Signal'] = np.select(conditions, ['BUY'], default='HOLD')
+    df['Signal'] = np.select(conditions, ['強力多頭'], default='震盪')
     
+    # 強力空頭 (SELL)
     sell_cond = (df['Close'] < df['EMA_21']) | (df['MACD_Hist'] < 0)
-    df.loc[sell_cond, 'Signal'] = 'SELL'
+    df.loc[sell_cond, 'Signal'] = '強力空頭'
     
     return df, None
 
@@ -129,21 +131,39 @@ def get_signal(ticker, atr_mult):
 
 @st.cache_data(ttl=60)
 def scan_market_summary(tickers, atr_mult):
-    summary = {"BUY": [], "HOLD": [], "SELL": []}
+    """批次掃描全市場訊號"""
+    # 儲存結構改為存放詳細資訊的列表
+    summary = {"強力多頭": [], "震盪": [], "強力空頭": []}
+    
     try:
+        # 批次下載
         data = yf.download(tickers, period="3mo", group_by='ticker', progress=False, threads=True)
+        
         for ticker in tickers:
             try:
                 df_t = data[ticker].copy()
                 if len(df_t) > 0:
                     if pd.isna(df_t.iloc[-1]['Close']): df_t = df_t.iloc[:-1]
                 if df_t.empty: continue
+                
+                # 計算訊號
                 df_t, err = calculate_technical_indicators(df_t, atr_mult)
                 if err: continue
-                last_sig = df_t.iloc[-1]['Signal']
-                if last_sig == "BUY": summary["BUY"].append(ticker)
-                elif last_sig == "SELL": summary["SELL"].append(ticker)
-                else: summary["HOLD"].append(ticker)
+                
+                last_row = df_t.iloc[-1]
+                last_sig = last_row['Signal']
+                
+                # 準備顯示字串：代碼 + 價格 + 漲跌
+                prev_close = df_t.iloc[-2]['Close']
+                pct_chg = ((last_row['Close'] - prev_close) / prev_close) * 100
+                display_str = f"{ticker} (${last_row['Close']:.2f} | {pct_chg:+.2f}%)"
+                
+                # 分類
+                if last_sig in summary:
+                    summary[last_sig].append(display_str)
+                else:
+                    summary["震盪"].append(display_str) # 預設
+                    
             except: continue
     except Exception as e: return None
     return summary
@@ -184,11 +204,8 @@ def get_advanced_pc_ratio(ticker, current_price):
         return {"ratio": ratio, "total_call": total_call_vol, "total_put": total_put_vol, "details": details}, None
     except Exception as e: return None, str(e)
 
-# --- 新增：綜合趨勢分析邏輯 ---
+# --- 綜合趨勢分析邏輯 ---
 def get_comprehensive_analysis(row, prev_row, pc_data):
-    """
-    綜合分析各項因子並產生條列式報告
-    """
     analysis_report = []
     bull_score = 0
     bear_score = 0
@@ -233,13 +250,13 @@ def get_comprehensive_analysis(row, prev_row, pc_data):
 
     # 4. 量價分析
     vol_ratio = row['Volume'] / row['Vol_SMA_10']
-    if row['Close'] > row['Open']: # 紅K
+    if row['Close'] > row['Open']:
         if vol_ratio > 1.2:
             analysis_report.append(("量價關係", "多頭", f"出量上漲 (量比 {vol_ratio:.1f}x)，攻擊量能充足。", 1))
             bull_score += 1
         elif vol_ratio < 0.8:
             analysis_report.append(("量價關係", "中性", "價漲量縮，追價意願不足。", 0))
-    else: # 黑K
+    else:
         if vol_ratio > 1.2:
             analysis_report.append(("量價關係", "空頭", f"出量下跌 (量比 {vol_ratio:.1f}x)，賣壓沈重。", -1))
             bear_score += 1
@@ -256,7 +273,6 @@ def get_comprehensive_analysis(row, prev_row, pc_data):
         else:
             analysis_report.append(("期權籌碼", "中性", f"P/C Ratio ({ratio:.2f}) 位於正常區間。", 0))
 
-    # 總結
     total_score = bull_score - bear_score
     if total_score >= 2.5: sentiment = "🚀 強力多頭"
     elif total_score >= 1: sentiment = "📈 偏多震盪"
@@ -301,6 +317,7 @@ if error:
 else:
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    # 更新 Signal 顯示文字
     signal = last['Signal']
     
     # 期權與存檔邏輯
@@ -319,13 +336,12 @@ else:
             pc_data = snap['pc_data']
             data_source_badge = f'<span class="snapshot-badge">📁 歷史快照 ({snap.get("date")})</span>'
 
-    # 執行綜合分析
     sentiment, analysis_report = get_comprehensive_analysis(last, prev, pc_data)
 
     # 頂部狀態
-    if signal == 'BUY': st.success(f"🔥 {selected_ticker} 強力買進 (STRONG BUY)")
-    elif signal == 'SELL': st.error(f"🛑 {selected_ticker} 離場/止損 (SELL/EXIT)")
-    else: st.info(f"👀 {selected_ticker} 觀望/持有 (HOLD)")
+    if signal == '強力多頭': st.success(f"🔥 {selected_ticker} 訊號：強力多頭 (STRONG BUY)")
+    elif signal == '強力空頭': st.error(f"🛑 {selected_ticker} 訊號：強力空頭 (STRONG SELL)")
+    else: st.info(f"👀 {selected_ticker} 訊號：震盪整理 (OSCILLATION)")
 
     # KPI
     k1, k2, k3, k4 = st.columns(4)
@@ -341,12 +357,10 @@ else:
         else: st.metric("P/C Ratio", "N/A", "無數據")
 
     st.markdown("---")
-
-    # --- 新增：AI 多空趨勢深度解析區塊 ---
+    
+    # AI 分析區塊
     st.markdown("### 🤖 AI 多空趨勢深度解析")
-    
     ana_col1, ana_col2 = st.columns([1, 2])
-    
     with ana_col1:
         st.markdown(f"""
         <div class="analysis-box" style="text-align:center; height: 100%;">
@@ -357,21 +371,14 @@ else:
             <p style="font-size: 0.9em; color: #888;">基於 期權、均線、MACD、RSI、量價 綜合運算</p>
         </div>
         """, unsafe_allow_html=True)
-
     with ana_col2:
         st.markdown('<div class="analysis-box">', unsafe_allow_html=True)
         for factor, trend, desc, score in analysis_report:
             if trend in ["多頭", "強勢/過熱"]: trend_cls = "trend-bull"
             elif trend in ["空頭", "超賣"]: trend_cls = "trend-bear"
             else: trend_cls = "trend-neutral"
-            
             icon = "🟢" if score > 0 else "🔴" if score < 0 else "⚪"
-            
-            st.markdown(f"""
-            <div class="factor-row">
-                <strong>{icon} {factor}</strong> <span class="{trend_cls}">[{trend}]</span> : {desc}
-            </div>
-            """, unsafe_allow_html=True)
+            st.markdown(f'<div class="factor-row"><strong>{icon} {factor}</strong> <span class="{trend_cls}">[{trend}]</span> : {desc}</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("---")
@@ -393,50 +400,66 @@ else:
             st.dataframe(pd.DataFrame(pc_data['details']).head(3), hide_index=True, use_container_width=True)
         else: st.warning("無資料")
 
-    # --- 歷史表格 ---
+    # 歷史數據
     with st.expander("查看技術數據"):
         cols_to_show = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'RSI', 'Signal', 'Stop_Loss']
-        
-        format_dict = {
-            'Close': '{:.2f}', 'Volume': '{:.0f}', 'EMA_8': '{:.2f}',
-            'EMA_21': '{:.2f}', 'MACD_Hist': '{:.2f}', 'RSI': '{:.1f}', 'Stop_Loss': '{:.2f}'
-        }
+        format_dict = {'Close': '{:.2f}', 'Volume': '{:.0f}', 'EMA_8': '{:.2f}', 'EMA_21': '{:.2f}', 'MACD_Hist': '{:.2f}', 'RSI': '{:.1f}', 'Stop_Loss': '{:.2f}'}
         st.dataframe(df[cols_to_show].tail(5).style.format(format_dict))
 
-# === B. 全市場訊號彙整總表 ===
+# === B. 全市場選股濾網 (Market Screener) ===
 st.markdown("---")
-st.subheader("🌍 全市場戰情總表 (Market Summary)")
+st.subheader("🌍 全市場戰情選股 (Market Screener)")
 
-with st.spinner("正在掃描市場訊號..."):
-    # 執行批次掃描
+with st.spinner("正在掃描全市場訊號..."):
     market_signals = scan_market_summary(TARGET_TICKERS, atr_multiplier)
 
 if market_signals:
-    # 整理資料為 DataFrame 格式以便顯示
-    max_len = max(len(market_signals["BUY"]), len(market_signals["HOLD"]), len(market_signals["SELL"]))
-    
-    # 補齊長度
-    buy_list = market_signals["BUY"] + [""] * (max_len - len(market_signals["BUY"]))
-    hold_list = market_signals["HOLD"] + [""] * (max_len - len(market_signals["HOLD"]))
-    sell_list = market_signals["SELL"] + [""] * (max_len - len(market_signals["SELL"]))
-    
-    summary_df = pd.DataFrame({
-        "BUY (強力買進)": buy_list,
-        "HOLD (觀望持有)": hold_list,
-        "SELL (離場止損)": sell_list
-    })
-    
-    # 顯示總表
-    st.dataframe(
-        summary_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "BUY (強力買進)": st.column_config.TextColumn(help="動能強勁，符合所有買進條件"),
-            "SELL (離場止損)": st.column_config.TextColumn(help="趨勢破壞，建議離場"),
-            "HOLD (觀望持有)": st.column_config.TextColumn(help="盤整中或趨勢不明顯")
-        }
+    # 建立選股濾網 UI
+    filter_option = st.selectbox(
+        "🔍 選擇市場狀態進行篩選：",
+        ["全部顯示 (All)", "強力多頭 (Strong Bull)", "震盪 (Oscillation)", "強力空頭 (Strong Bear)"]
     )
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # 根據選擇顯示結果
+    if filter_option == "全部顯示 (All)":
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.info(f"🐂 強力多頭 ({len(market_signals['強力多頭'])})")
+            for item in market_signals['強力多頭']: st.write(item)
+        with col2:
+            st.warning(f"⚖️ 震盪整理 ({len(market_signals['震盪'])})")
+            for item in market_signals['震盪']: st.write(item)
+        with col3:
+            st.error(f"🐻 強力空頭 ({len(market_signals['強力空頭'])})")
+            for item in market_signals['強力空頭']: st.write(item)
+            
+    elif filter_option == "強力多頭 (Strong Bull)":
+        st.success(f"🐂 目前符合「強力多頭」條件的股票 ({len(market_signals['強力多頭'])})：")
+        if market_signals['強力多頭']:
+            # 轉成 DataFrame 顯示更漂亮
+            df_bull = pd.DataFrame(market_signals['強力多頭'], columns=["股票代碼 / 價格"])
+            st.dataframe(df_bull, use_container_width=True, hide_index=True)
+        else:
+            st.write("目前無符合標的。")
+            
+    elif filter_option == "震盪 (Oscillation)":
+        st.warning(f"⚖️ 目前處於「震盪整理」的股票 ({len(market_signals['震盪'])})：")
+        if market_signals['震盪']:
+            df_osc = pd.DataFrame(market_signals['震盪'], columns=["股票代碼 / 價格"])
+            st.dataframe(df_osc, use_container_width=True, hide_index=True)
+        else:
+            st.write("目前無符合標的。")
+            
+    elif filter_option == "強力空頭 (Strong Bear)":
+        st.error(f"🐻 目前符合「強力空頭」條件的股票 ({len(market_signals['強力空頭'])})：")
+        if market_signals['強力空頭']:
+            df_bear = pd.DataFrame(market_signals['強力空頭'], columns=["股票代碼 / 價格"])
+            st.dataframe(df_bear, use_container_width=True, hide_index=True)
+        else:
+            st.write("目前無符合標的。")
+
 else:
     st.error("無法取得市場總覽數據")
 
