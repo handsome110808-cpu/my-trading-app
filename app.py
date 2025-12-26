@@ -28,6 +28,13 @@ st.markdown("""
     .countdown-box { position: fixed; bottom: 10px; right: 10px; background-color: #ffffff; border: 1px solid #ddd; padding: 5px 10px; border-radius: 5px; font-size: 12px; color: #666; z-index: 999; }
     .snapshot-badge { background-color: #e3f2fd; color: #1565c0; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; border: 1px solid #bbdefb; }
     
+    /* 分析報告樣式 */
+    .analysis-box { background-color: #ffffff; padding: 20px; border-radius: 10px; border: 1px solid #e0e0e0; margin-bottom: 20px; }
+    .trend-bull { color: #00c853; font-weight: bold; }
+    .trend-bear { color: #d50000; font-weight: bold; }
+    .trend-neutral { color: #ffab00; font-weight: bold; }
+    .factor-row { margin-bottom: 8px; border-bottom: 1px solid #eee; padding-bottom: 8px; }
+    
     /* 總表樣式優化 */
     .summary-header { font-size: 20px; font-weight: bold; margin-bottom: 10px; text-align: center; }
 </style>
@@ -35,7 +42,6 @@ st.markdown("""
 
 # --- 3. 全域設定與快照功能 ---
 SNAPSHOT_FILE = 'options_history.json'
-# 指定的目標股票清單
 TARGET_TICKERS = sorted([
     "AAPL", "AMD", "APP", "ASML", "AVGO", "GOOG", "HIMS", "INTC",
     "LLY", "LRCX", "MSFT", "MU", "NBIS", "NVDA", "ORCL", "PLTR",
@@ -66,13 +72,10 @@ def save_snapshot(ticker, price, pc_data):
     with open(SNAPSHOT_FILE, 'w') as f: json.dump(all_data, f, indent=4)
     return True
 
-# --- 4. 核心運算邏輯 (提取共用) ---
+# --- 4. 核心運算邏輯 ---
 def calculate_technical_indicators(df, atr_mult):
     """共用的技術指標與訊號計算邏輯"""
-    # 確保數據足夠
     if len(df) < 50: return df, "數據不足"
-    
-    # 填補空值
     df = df.ffill()
 
     # 計算指標
@@ -82,7 +85,6 @@ def calculate_technical_indicators(df, atr_mult):
     macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
     if macd is not None:
         df = pd.concat([df, macd], axis=1)
-        # 重新命名欄位，避免後續抓不到
         cols_map = {
             df.columns[-3]: 'MACD_Line', 
             df.columns[-2]: 'MACD_Hist', 
@@ -92,10 +94,10 @@ def calculate_technical_indicators(df, atr_mult):
 
     df['Vol_SMA_10'] = ta.sma(df['Volume'], length=10)
     df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+    df['RSI'] = ta.rsi(df['Close'], length=14) # 新增 RSI
     df['Stop_Loss'] = df['Close'] - (df['ATR'] * atr_mult)
 
     # 訊號判定邏輯
-    # 1. 買進條件
     conditions = [
         (df['Close'] > df['EMA_8']) & 
         (df['EMA_8'] > df['EMA_21']) & 
@@ -105,7 +107,6 @@ def calculate_technical_indicators(df, atr_mult):
     ]
     df['Signal'] = np.select(conditions, ['BUY'], default='HOLD')
     
-    # 2. 賣出條件 (優先權高於 HOLD)
     sell_cond = (df['Close'] < df['EMA_21']) | (df['MACD_Hist'] < 0)
     df.loc[sell_cond, 'Signal'] = 'SELL'
     
@@ -113,62 +114,38 @@ def calculate_technical_indicators(df, atr_mult):
 
 @st.cache_data(ttl=60)
 def get_signal(ticker, atr_mult):
-    """單一股票詳細分析"""
     try:
         df = yf.download(ticker, period="6mo", progress=False)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         
-        # 處理非交易時段的空數據
         if len(df) > 0:
             last_row = df.iloc[-1]
             if pd.isna(last_row['Close']) or pd.isna(last_row['Open']): df = df.iloc[:-1]
 
-        # 呼叫共用邏輯
         df, err = calculate_technical_indicators(df, atr_mult)
         if err: return None, err
-        
         return df, None
-    except Exception as e:
-        return None, str(e)
+    except Exception as e: return None, str(e)
 
 @st.cache_data(ttl=60)
 def scan_market_summary(tickers, atr_mult):
-    """批次掃描全市場訊號 (總表用)"""
     summary = {"BUY": [], "HOLD": [], "SELL": []}
-    
     try:
-        # 批次下載，使用 group_by='ticker' 方便後續處理
         data = yf.download(tickers, period="3mo", group_by='ticker', progress=False, threads=True)
-        
         for ticker in tickers:
             try:
-                # 處理 MultiIndex 資料結構
                 df_t = data[ticker].copy()
-                
-                # 簡單清洗
                 if len(df_t) > 0:
-                    last_row = df_t.iloc[-1]
-                    if pd.isna(last_row['Close']): df_t = df_t.iloc[:-1]
-                
+                    if pd.isna(df_t.iloc[-1]['Close']): df_t = df_t.iloc[:-1]
                 if df_t.empty: continue
-
-                # 計算訊號 (使用相同的邏輯)
                 df_t, err = calculate_technical_indicators(df_t, atr_mult)
-                
                 if err: continue
-                
                 last_sig = df_t.iloc[-1]['Signal']
-                
-                # 分類
                 if last_sig == "BUY": summary["BUY"].append(ticker)
                 elif last_sig == "SELL": summary["SELL"].append(ticker)
                 else: summary["HOLD"].append(ticker)
-            except:
-                continue
-                
-    except Exception as e:
-        return None
-        
+            except: continue
+    except Exception as e: return None
     return summary
 
 @st.cache_data(ttl=300)
@@ -177,7 +154,6 @@ def get_advanced_pc_ratio(ticker, current_price):
         tk = yf.Ticker(ticker)
         expirations = tk.options
         if not expirations: return None, "無期權數據"
-
         today = datetime.date.today()
         valid_dates = []
         for date_str in expirations:
@@ -185,17 +161,15 @@ def get_advanced_pc_ratio(ticker, current_price):
                 exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
                 if 0 <= (exp_date - today).days <= 40: valid_dates.append(date_str)
             except: continue
-
         if not valid_dates: return None, "無 40 日內到期合約"
 
         total_call_vol = 0; total_put_vol = 0; details = []
-
         for date in valid_dates:
             try:
                 opt = tk.option_chain(date)
                 calls, puts = opt.calls, opt.puts
                 if calls is None or puts is None or calls.empty or puts.empty: continue
-
+                
                 center_idx_c = (np.abs(calls['strike'] - current_price)).argmin()
                 c_vol = calls.iloc[max(0,center_idx_c-5):min(len(calls),center_idx_c+6)]['volume'].fillna(0).sum()
                 
@@ -210,6 +184,87 @@ def get_advanced_pc_ratio(ticker, current_price):
         return {"ratio": ratio, "total_call": total_call_vol, "total_put": total_put_vol, "details": details}, None
     except Exception as e: return None, str(e)
 
+# --- 新增：綜合趨勢分析邏輯 ---
+def get_comprehensive_analysis(row, prev_row, pc_data):
+    """
+    綜合分析各項因子並產生條列式報告
+    """
+    analysis_report = []
+    bull_score = 0
+    bear_score = 0
+    
+    # 1. 均線分析
+    if row['Close'] > row['EMA_8'] > row['EMA_21']:
+        analysis_report.append(("均線系統", "多頭", "收盤價站上短長均線，呈現多頭排列發散。", 1))
+        bull_score += 1
+    elif row['Close'] < row['EMA_21']:
+        analysis_report.append(("均線系統", "空頭", "收盤價跌破長期均線 (EMA21)，趨勢轉弱。", -1))
+        bear_score += 1
+    else:
+        analysis_report.append(("均線系統", "中性", "價格介於均線之間，震盪整理中。", 0))
+
+    # 2. MACD 分析
+    if row['MACD_Hist'] > 0:
+        if row['MACD_Hist'] > prev_row['MACD_Hist']:
+            analysis_report.append(("MACD 動能", "多頭", "紅柱持續放大，上漲動能強勁。", 1))
+            bull_score += 1
+        else:
+            analysis_report.append(("MACD 動能", "中性", "紅柱收斂，漲勢可能放緩。", 0))
+    else:
+        analysis_report.append(("MACD 動能", "空頭", "綠柱空方控盤，動能偏弱。", -1))
+        bear_score += 1
+
+    # 3. RSI 分析
+    rsi = row['RSI']
+    if rsi > 50:
+        if rsi > 70:
+            analysis_report.append(("RSI 指標", "強勢/過熱", f"RSI 為 {rsi:.1f}，進入超買區，需留意回調風險。", 0.5))
+            bull_score += 0.5
+        else:
+            analysis_report.append(("RSI 指標", "多頭", f"RSI 為 {rsi:.1f}，位於多方強勢區。", 1))
+            bull_score += 1
+    else:
+        if rsi < 30:
+            analysis_report.append(("RSI 指標", "超賣", f"RSI 為 {rsi:.1f}，進入超賣區，可能醞釀反彈。", -0.5))
+            bear_score += 0.5
+        else:
+            analysis_report.append(("RSI 指標", "空頭", f"RSI 為 {rsi:.1f}，位於弱勢區。", -1))
+            bear_score += 1
+
+    # 4. 量價分析
+    vol_ratio = row['Volume'] / row['Vol_SMA_10']
+    if row['Close'] > row['Open']: # 紅K
+        if vol_ratio > 1.2:
+            analysis_report.append(("量價關係", "多頭", f"出量上漲 (量比 {vol_ratio:.1f}x)，攻擊量能充足。", 1))
+            bull_score += 1
+        elif vol_ratio < 0.8:
+            analysis_report.append(("量價關係", "中性", "價漲量縮，追價意願不足。", 0))
+    else: # 黑K
+        if vol_ratio > 1.2:
+            analysis_report.append(("量價關係", "空頭", f"出量下跌 (量比 {vol_ratio:.1f}x)，賣壓沈重。", -1))
+            bear_score += 1
+    
+    # 5. 期權 P/C Ratio 分析
+    if pc_data:
+        ratio = pc_data['ratio']
+        if ratio < 0.7:
+            analysis_report.append(("期權籌碼", "多頭", f"P/C Ratio ({ratio:.2f}) 偏低，市場看多情緒濃厚。", 1))
+            bull_score += 1
+        elif ratio > 1.1:
+            analysis_report.append(("期權籌碼", "空頭", f"P/C Ratio ({ratio:.2f}) 偏高，市場避險情緒上升。", -1))
+            bear_score += 1
+        else:
+            analysis_report.append(("期權籌碼", "中性", f"P/C Ratio ({ratio:.2f}) 位於正常區間。", 0))
+
+    # 總結
+    total_score = bull_score - bear_score
+    if total_score >= 2.5: sentiment = "🚀 強力多頭"
+    elif total_score >= 1: sentiment = "📈 偏多震盪"
+    elif total_score <= -2.5: sentiment = "🩸 強力空頭"
+    elif total_score <= -1: sentiment = "📉 偏空震盪"
+    else: sentiment = "⚖️ 多空平衡"
+    
+    return sentiment, analysis_report
 
 # --- 5. 介面佈局 ---
 st.title("AlphaTrader 量化終端")
@@ -264,6 +319,9 @@ else:
             pc_data = snap['pc_data']
             data_source_badge = f'<span class="snapshot-badge">📁 歷史快照 ({snap.get("date")})</span>'
 
+    # 執行綜合分析
+    sentiment, analysis_report = get_comprehensive_analysis(last, prev, pc_data)
+
     # 頂部狀態
     if signal == 'BUY': st.success(f"🔥 {selected_ticker} 強力買進 (STRONG BUY)")
     elif signal == 'SELL': st.error(f"🛑 {selected_ticker} 離場/止損 (SELL/EXIT)")
@@ -284,6 +342,40 @@ else:
 
     st.markdown("---")
 
+    # --- 新增：AI 多空趨勢深度解析區塊 ---
+    st.markdown("### 🤖 AI 多空趨勢深度解析")
+    
+    ana_col1, ana_col2 = st.columns([1, 2])
+    
+    with ana_col1:
+        st.markdown(f"""
+        <div class="analysis-box" style="text-align:center; height: 100%;">
+            <h3 style="margin-bottom:0;">總結趨勢</h3>
+            <h1 style="font-size: 3em; margin: 10px 0;">{sentiment.split(' ')[0]}</h1>
+            <h4 style="color: #666;">{sentiment.split(' ')[1]}</h4>
+            <hr>
+            <p style="font-size: 0.9em; color: #888;">基於 期權、均線、MACD、RSI、量價 綜合運算</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with ana_col2:
+        st.markdown('<div class="analysis-box">', unsafe_allow_html=True)
+        for factor, trend, desc, score in analysis_report:
+            if trend in ["多頭", "強勢/過熱"]: trend_cls = "trend-bull"
+            elif trend in ["空頭", "超賣"]: trend_cls = "trend-bear"
+            else: trend_cls = "trend-neutral"
+            
+            icon = "🟢" if score > 0 else "🔴" if score < 0 else "⚪"
+            
+            st.markdown(f"""
+            <div class="factor-row">
+                <strong>{icon} {factor}</strong> <span class="{trend_cls}">[{trend}]</span> : {desc}
+            </div>
+            """, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
     # 圖表
     main_col, side_col = st.columns([2, 1])
     with main_col:
@@ -301,20 +393,14 @@ else:
             st.dataframe(pd.DataFrame(pc_data['details']).head(3), hide_index=True, use_container_width=True)
         else: st.warning("無資料")
 
-    # --- 歷史表格 (已修復 ValueError) ---
+    # --- 歷史表格 ---
     with st.expander("查看技術數據"):
-        cols_to_show = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'Signal', 'Stop_Loss']
+        cols_to_show = ['Close', 'Volume', 'EMA_8', 'EMA_21', 'MACD_Hist', 'RSI', 'Signal', 'Stop_Loss']
         
-        # 關鍵修正：針對數字欄位設定格式，避開文字欄位 'Signal'
         format_dict = {
-            'Close': '{:.2f}',
-            'Volume': '{:.0f}',
-            'EMA_8': '{:.2f}',
-            'EMA_21': '{:.2f}',
-            'MACD_Hist': '{:.2f}',
-            'Stop_Loss': '{:.2f}'
+            'Close': '{:.2f}', 'Volume': '{:.0f}', 'EMA_8': '{:.2f}',
+            'EMA_21': '{:.2f}', 'MACD_Hist': '{:.2f}', 'RSI': '{:.1f}', 'Stop_Loss': '{:.2f}'
         }
-        
         st.dataframe(df[cols_to_show].tail(5).style.format(format_dict))
 
 # === B. 全市場訊號彙整總表 ===
